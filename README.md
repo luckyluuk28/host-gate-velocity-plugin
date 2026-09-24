@@ -39,14 +39,6 @@ The generated configuration documents all available options.
 Allowed entries can include exact hostnames, exact IPv4/IPv6 addresses, and
 single-level DNS wildcards such as `*.example.com`.
 
-The configuration can be reloaded without restarting Velocity:
-
-```text
-/hostgate reload
-```
-
-Players require the `hostgate.reload` permission to use the reload command.
-
 ## Security considerations
 
 Host Gate checks the hostname claimed by the Minecraft client. It makes generic
