@@ -7,7 +7,7 @@
 
   <groupId>net.hostgate</groupId>
   <artifactId>hostgate</artifactId>
-  <version>1.0.4</version>
+  <version>1.1.0</version>
 
   <name>Host Gate</name>
   <description>Velocity plugin that restricts Minecraft connections to approved hostnames.</description>
@@ -103,4 +103,3 @@
     </plugins>
   </build>
 </project>
-
