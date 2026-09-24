@@ -17,7 +17,7 @@ import org.tomlj.TomlArray;
 import org.tomlj.TomlParseResult;
 
 import java.io.IOException;
-import java.io.Reader;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,8 +33,8 @@ import java.util.regex.Pattern;
 @Plugin(
         id = "hostgate",
         name = "Host Gate",
-        version = "1.0.4",
-        description = "Suppresses Minecraft status pings and rejects logins for unlisted hostnames"
+        version = "1.0.5",
+        description = "Suppresses Minecraft status pings and silently closes logins for unlisted hostnames"
 )
 public final class HostGatePlugin {
     private static final String DEFAULT_CONFIG =
@@ -43,7 +43,7 @@ public final class HostGatePlugin {
                     + "\n"
                     + "# Optional allowed hosts.\n"
                     + "additionalAllowedHosts = [\n"
-                    + "     # *.example.com\n"
+                    + "     # \"*.example.com\"\n"
                     + "]\n";
 
     private final ProxyServer proxyServer;
@@ -51,6 +51,16 @@ public final class HostGatePlugin {
     private final Path dataDirectory;
 
     private volatile Policy policy = Policy.denyAll();
+
+    /*
+     * Cached Velocity implementation methods used for silent connection
+     * termination.
+     *
+     * These are deliberately accessed through reflection so Host Gate only
+     * needs Velocity's public API as a compile-time dependency.
+     */
+    private volatile Method delegatedConnectionMethod;
+    private volatile Method closeConnectionMethod;
 
     @Inject
     public HostGatePlugin(
@@ -80,18 +90,25 @@ public final class HostGatePlugin {
             }
 
             TomlParseResult config = Toml.parse(tomlFile);
+
             if (config.hasErrors()) {
-                throw new IOException("Invalid TOML: " + config.errors());
+                throw new IOException(
+                        "Invalid TOML: " + config.errors()
+                );
             }
 
-            Object restrictionValue = config.get("allowOnlyForcedHosts");
+            Object restrictionValue =
+                    config.get("allowOnlyForcedHosts");
+
             if (!(restrictionValue instanceof Boolean restricted)) {
                 throw new IOException(
                         "allowOnlyForcedHosts must be a TOML boolean"
                 );
             }
 
-            Object hostsValue = config.get("additionalAllowedHosts");
+            Object hostsValue =
+                    config.get("additionalAllowedHosts");
+
             if (!(hostsValue instanceof TomlArray hosts)) {
                 throw new IOException(
                         "additionalAllowedHosts must be a TOML array"
@@ -103,9 +120,11 @@ public final class HostGatePlugin {
 
             for (int i = 0; i < hosts.size(); i++) {
                 Object value = hosts.get(i);
+
                 if (!(value instanceof String hostPattern)) {
                     throw new IOException(
-                            "additionalAllowedHosts entry " + i
+                            "additionalAllowedHosts entry "
+                                    + i
                                     + " must be a string"
                     );
                 }
@@ -147,13 +166,16 @@ public final class HostGatePlugin {
                     && exactHosts.isEmpty()
                     && wildcardPatterns.isEmpty()) {
                 logger.warn(
-                        "No hostnames are allowed; all pings and logins will be denied"
+                        "No hostnames are allowed; "
+                                + "all pings and logins will be denied"
                 );
             }
         } catch (IOException | RuntimeException e) {
             policy = Policy.denyAll();
+
             logger.error(
-                    "Could not load valid {}; all pings and logins will be denied",
+                    "Could not load valid {}; "
+                            + "all pings and logins will be denied",
                     tomlFile,
                     e
             );
@@ -169,12 +191,15 @@ public final class HostGatePlugin {
 
         if (!isValidPattern(value)) {
             throw new IOException(
-                    "Invalid additionalAllowedHosts entry: " + rawPattern
+                    "Invalid additionalAllowedHosts entry: "
+                            + rawPattern
             );
         }
 
         if (value.contains("*")) {
-            wildcardPatterns.add(compileWildcard(value));
+            wildcardPatterns.add(
+                    compileWildcard(value)
+            );
         } else {
             exactHosts.add(value);
         }
@@ -214,17 +239,26 @@ public final class HostGatePlugin {
 
         for (int i = 0; i < wildcard.length(); i++) {
             if (wildcard.charAt(i) == '*') {
-                regex.append(Pattern.quote(
-                        wildcard.substring(literalStart, i)
-                ));
+                regex.append(
+                        Pattern.quote(
+                                wildcard.substring(
+                                        literalStart,
+                                        i
+                                )
+                        )
+                );
+
                 regex.append(".*");
                 literalStart = i + 1;
             }
         }
 
-        regex.append(Pattern.quote(
-                wildcard.substring(literalStart)
-        ));
+        regex.append(
+                Pattern.quote(
+                        wildcard.substring(literalStart)
+                )
+        );
+
         regex.append("$");
 
         return Pattern.compile(regex.toString());
@@ -242,17 +276,32 @@ public final class HostGatePlugin {
         }
 
         try {
-            return connection.getVirtualHost()
-                    .map(address -> normalizeHost(address.getHostString()))
-                    .map(host -> isAllowedHost(host, current))
+            return connection
+                    .getVirtualHost()
+                    .map(address ->
+                            normalizeHost(
+                                    address.getHostString()
+                            )
+                    )
+                    .map(host ->
+                            isAllowedHost(host, current)
+                    )
                     .orElse(false);
         } catch (RuntimeException e) {
-            logger.error("Could not check hostname; denying connection", e);
+            logger.error(
+                    "Could not check hostname; "
+                            + "denying connection",
+                    e
+            );
+
             return false;
         }
     }
 
-    private boolean isAllowedHost(String host, Policy current) {
+    private boolean isAllowedHost(
+            String host,
+            Policy current
+    ) {
         if (current.exactHosts().contains(host)) {
             return true;
         }
@@ -263,12 +312,106 @@ public final class HostGatePlugin {
             }
         }
 
-        return proxyServer.getConfiguration()
+        return proxyServer
+                .getConfiguration()
                 .getForcedHosts()
                 .keySet()
                 .stream()
                 .map(HostGatePlugin::normalizeHost)
                 .anyMatch(host::equals);
+    }
+
+    private boolean closeSilently(
+            InboundConnection connection
+    ) {
+        try {
+            Method delegatedMethod =
+                    delegatedConnectionMethod;
+
+            if (delegatedMethod == null
+                    || !delegatedMethod
+                    .getDeclaringClass()
+                    .isAssignableFrom(connection.getClass())) {
+
+                delegatedMethod = findDeclaredMethod(
+                        connection.getClass(),
+                        "delegatedConnection"
+                );
+
+                delegatedMethod.setAccessible(true);
+                delegatedConnectionMethod = delegatedMethod;
+            }
+
+            Object minecraftConnection =
+                    delegatedMethod.invoke(connection);
+
+            if (minecraftConnection == null) {
+                throw new IllegalStateException(
+                        "Velocity delegated connection was null"
+                );
+            }
+
+            Method closeMethod =
+                    closeConnectionMethod;
+
+            if (closeMethod == null
+                    || !closeMethod
+                    .getDeclaringClass()
+                    .isAssignableFrom(
+                            minecraftConnection.getClass()
+                    )) {
+
+                closeMethod =
+                        minecraftConnection
+                                .getClass()
+                                .getMethod(
+                                        "close",
+                                        boolean.class
+                                );
+
+                closeConnectionMethod = closeMethod;
+            }
+
+            closeMethod.invoke(
+                    minecraftConnection,
+                    true
+            );
+
+            return true;
+        } catch (ReflectiveOperationException
+                 | RuntimeException e) {
+
+            logger.error(
+                    "Host Gate could not silently close "
+                            + "a rejected connection",
+                    e
+            );
+
+            return false;
+        }
+    }
+
+    private static Method findDeclaredMethod(
+            Class<?> type,
+            String name,
+            Class<?>... parameterTypes
+    ) throws NoSuchMethodException {
+        Class<?> current = type;
+
+        while (current != null) {
+            try {
+                return current.getDeclaredMethod(
+                        name,
+                        parameterTypes
+                );
+            } catch (NoSuchMethodException ignored) {
+                current = current.getSuperclass();
+            }
+        }
+
+        throw new NoSuchMethodException(
+                type.getName() + "." + name
+        );
     }
 
     private record Policy(
@@ -278,25 +421,39 @@ public final class HostGatePlugin {
             List<Pattern> wildcardPatterns
     ) {
         private static Policy denyAll() {
-            return new Policy(false, true, Set.of(), List.of());
+            return new Policy(
+                    false,
+                    true,
+                    Set.of(),
+                    List.of()
+            );
         }
     }
 
     @Subscribe
     public void onPing(ProxyPingEvent event) {
         if (!isAllowed(event.getConnection())) {
-            event.setResult(ResultedEvent.GenericResult.denied());
+            event.setResult(
+                    ResultedEvent.GenericResult.denied()
+            );
         }
     }
 
     @Subscribe
     public void onPreLogin(PreLoginEvent event) {
-        if (!isAllowed(event.getConnection())) {
-            event.setResult(
-                    PreLoginEvent.PreLoginComponentResult.denied(
-                            Component.text("Disconnected")
-                    )
-            );
+        if (isAllowed(event.getConnection())) {
+            return;
         }
+
+        if (closeSilently(event.getConnection())) {
+            return;
+        }
+
+        /** Failback if for some reason the close connection doesnt work, to prevent allowing anyone to still access invalid hostnames/ips */
+        event.setResult(
+                PreLoginEvent.PreLoginComponentResult.denied(
+                        Component.text("Disconnected")
+                )
+        );
     }
 }
