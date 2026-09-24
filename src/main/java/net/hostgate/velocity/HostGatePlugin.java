@@ -52,13 +52,6 @@ public final class HostGatePlugin {
 
     private volatile Policy policy = Policy.denyAll();
 
-    /*
-     * Cached Velocity implementation methods used for silent connection
-     * termination.
-     *
-     * These are deliberately accessed through reflection so Host Gate only
-     * needs Velocity's public API as a compile-time dependency.
-     */
     private volatile Method delegatedConnectionMethod;
     private volatile Method closeConnectionMethod;
 
