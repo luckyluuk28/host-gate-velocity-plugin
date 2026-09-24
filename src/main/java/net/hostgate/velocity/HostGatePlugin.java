@@ -1,6 +1,8 @@
 package net.hostgate.velocity;
 
 import com.google.inject.Inject;
+import com.velocitypowered.api.command.CommandMeta;
+import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.ResultedEvent;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
@@ -18,6 +20,7 @@ import org.tomlj.TomlParseResult;
 
 import java.io.IOException;
 import java.lang.reflect.Method;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,25 +29,31 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Pattern;
 
 @Plugin(
         id = "hostgate",
         name = "Host Gate",
-        version = "1.0.5",
-        description = "Suppresses Minecraft status pings and silently closes logins for unlisted hostnames"
+        version = "1.1.0",
+        description = "Suppresses Minecraft status pings and rejects connections for unlisted hostnames"
 )
 public final class HostGatePlugin {
     private static final String DEFAULT_CONFIG =
-            "# Hostnames in velocity.toml [forced-hosts] are allowed by default.\n"
-                    + "allowOnlyForcedHosts = true\n"
+            "allowOnlyForcedHosts = true\n"
                     + "\n"
-                    + "# Optional allowed hosts.\n"
                     + "additionalAllowedHosts = [\n"
-                    + "     # \"*.example.com\"\n"
-                    + "]\n";
+                    + "    # \"mc.example.com\",\n"
+                    + "    # \"*.mc.example.com\"\n"
+                    + "]\n"
+                    + "\n"
+                    + "rejectMode = \"silent\"\n"
+                    + "disconnectMessage = \"Disconnected\"\n"
+                    + "\n"
+                    + "logRejectedConnections = false\n"
+                    + "logRejectedPings = false\n"
+                    + "\n"
+                    + "failClosed = true\n";
 
     private final ProxyServer proxyServer;
     private final Logger logger;
@@ -68,10 +77,10 @@ public final class HostGatePlugin {
 
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
-        Path tomlFile = dataDirectory.resolve("config.toml");
-
         try {
             Files.createDirectories(dataDirectory);
+
+            Path tomlFile = getConfigPath();
 
             if (Files.notExists(tomlFile)) {
                 Files.writeString(
@@ -81,7 +90,29 @@ public final class HostGatePlugin {
                         StandardOpenOption.CREATE_NEW
                 );
             }
+        } catch (IOException e) {
+            policy = Policy.denyAll();
+            logger.error("Could not create Host Gate configuration", e);
+        }
 
+        reloadConfiguration();
+
+        CommandMeta meta = proxyServer
+                .getCommandManager()
+                .metaBuilder("hostgate")
+                .plugin(this)
+                .build();
+
+        proxyServer
+                .getCommandManager()
+                .register(meta, new HostGateCommand());
+    }
+
+    private boolean reloadConfiguration() {
+        Path tomlFile = getConfigPath();
+        boolean failClosed = true;
+
+        try {
             TomlParseResult config = Toml.parse(tomlFile);
 
             if (config.hasErrors()) {
@@ -90,43 +121,85 @@ public final class HostGatePlugin {
                 );
             }
 
-            Object restrictionValue =
-                    config.get("allowOnlyForcedHosts");
+            failClosed = getBoolean(
+                    config,
+                    "failClosed",
+                    true
+            );
 
-            if (!(restrictionValue instanceof Boolean restricted)) {
+            boolean allowOnlyForcedHosts = getBoolean(
+                    config,
+                    "allowOnlyForcedHosts",
+                    true
+            );
+
+            String rejectModeValue = getString(
+                    config,
+                    "rejectMode",
+                    "silent"
+            );
+
+            RejectMode rejectMode;
+
+            try {
+                rejectMode = RejectMode.valueOf(
+                        rejectModeValue
+                                .strip()
+                                .toUpperCase(Locale.ROOT)
+                );
+            } catch (IllegalArgumentException e) {
                 throw new IOException(
-                        "allowOnlyForcedHosts must be a TOML boolean"
+                        "rejectMode must be \"silent\" or \"disconnect\""
                 );
             }
 
-            Object hostsValue =
-                    config.get("additionalAllowedHosts");
+            String disconnectMessage = getString(
+                    config,
+                    "disconnectMessage",
+                    "Disconnected"
+            );
 
-            if (!(hostsValue instanceof TomlArray hosts)) {
-                throw new IOException(
-                        "additionalAllowedHosts must be a TOML array"
-                );
-            }
+            boolean logRejectedConnections = getBoolean(
+                    config,
+                    "logRejectedConnections",
+                    false
+            );
+
+            boolean logRejectedPings = getBoolean(
+                    config,
+                    "logRejectedPings",
+                    false
+            );
 
             Set<String> exactHosts = new HashSet<>();
             List<Pattern> wildcardPatterns = new ArrayList<>();
 
-            for (int i = 0; i < hosts.size(); i++) {
-                Object value = hosts.get(i);
+            Object hostsValue = config.get("additionalAllowedHosts");
 
-                if (!(value instanceof String hostPattern)) {
+            if (hostsValue != null) {
+                if (!(hostsValue instanceof TomlArray hosts)) {
                     throw new IOException(
-                            "additionalAllowedHosts entry "
-                                    + i
-                                    + " must be a string"
+                            "additionalAllowedHosts must be a TOML array"
                     );
                 }
 
-                addHostPattern(
-                        hostPattern,
-                        exactHosts,
-                        wildcardPatterns
-                );
+                for (int i = 0; i < hosts.size(); i++) {
+                    Object value = hosts.get(i);
+
+                    if (!(value instanceof String hostPattern)) {
+                        throw new IOException(
+                                "additionalAllowedHosts entry "
+                                        + i
+                                        + " must be a string"
+                        );
+                    }
+
+                    addHostPattern(
+                            hostPattern,
+                            exactHosts,
+                            wildcardPatterns
+                    );
+                }
             }
 
             int forcedHostCount = proxyServer
@@ -136,21 +209,26 @@ public final class HostGatePlugin {
 
             policy = new Policy(
                     true,
-                    restricted,
+                    allowOnlyForcedHosts,
                     Set.copyOf(exactHosts),
-                    List.copyOf(wildcardPatterns)
+                    List.copyOf(wildcardPatterns),
+                    rejectMode,
+                    disconnectMessage,
+                    logRejectedConnections,
+                    logRejectedPings
             );
 
             logger.info(
-                    "Host Gate: allowOnlyForcedHosts={}, {} exact extra(s), "
-                            + "{} wildcard(s), {} forced host(s)",
-                    restricted,
+                    "Host Gate loaded: allowOnlyForcedHosts={}, rejectMode={}, "
+                            + "{} exact extra(s), {} wildcard(s), {} forced host(s)",
+                    allowOnlyForcedHosts,
+                    rejectMode.name().toLowerCase(Locale.ROOT),
                     exactHosts.size(),
                     wildcardPatterns.size(),
                     forcedHostCount
             );
 
-            if (!restricted) {
+            if (!allowOnlyForcedHosts) {
                 logger.warn(
                         "Host Gate hostname restriction is disabled; "
                                 + "IP and other hostnames are allowed"
@@ -160,19 +238,69 @@ public final class HostGatePlugin {
                     && wildcardPatterns.isEmpty()) {
                 logger.warn(
                         "No hostnames are allowed; "
-                                + "all pings and logins will be denied"
+                                + "all pings and logins will be rejected"
                 );
             }
+
+            return true;
         } catch (IOException | RuntimeException e) {
-            policy = Policy.denyAll();
+            policy = failClosed
+                    ? Policy.denyAll()
+                    : Policy.allowAll();
 
             logger.error(
-                    "Could not load valid {}; "
-                            + "all pings and logins will be denied",
+                    "Could not load valid {}; Host Gate is failing {}",
                     tomlFile,
+                    failClosed ? "closed" : "open",
                     e
             );
+
+            return false;
         }
+    }
+
+    private Path getConfigPath() {
+        return dataDirectory.resolve("config.toml");
+    }
+
+    private static boolean getBoolean(
+            TomlParseResult config,
+            String key,
+            boolean defaultValue
+    ) throws IOException {
+        Object value = config.get(key);
+
+        if (value == null) {
+            return defaultValue;
+        }
+
+        if (!(value instanceof Boolean booleanValue)) {
+            throw new IOException(
+                    key + " must be a TOML boolean"
+            );
+        }
+
+        return booleanValue;
+    }
+
+    private static String getString(
+            TomlParseResult config,
+            String key,
+            String defaultValue
+    ) throws IOException {
+        Object value = config.get(key);
+
+        if (value == null) {
+            return defaultValue;
+        }
+
+        if (!(value instanceof String stringValue)) {
+            throw new IOException(
+                    key + " must be a TOML string"
+            );
+        }
+
+        return stringValue;
     }
 
     private static void addHostPattern(
@@ -271,19 +399,13 @@ public final class HostGatePlugin {
         try {
             return connection
                     .getVirtualHost()
-                    .map(address ->
-                            normalizeHost(
-                                    address.getHostString()
-                            )
-                    )
-                    .map(host ->
-                            isAllowedHost(host, current)
-                    )
+                    .map(InetSocketAddress::getHostString)
+                    .map(HostGatePlugin::normalizeHost)
+                    .map(host -> isAllowedHost(host, current))
                     .orElse(false);
         } catch (RuntimeException e) {
             logger.error(
-                    "Could not check hostname; "
-                            + "denying connection",
+                    "Could not check hostname; denying connection",
                     e
             );
 
@@ -314,12 +436,37 @@ public final class HostGatePlugin {
                 .anyMatch(host::equals);
     }
 
+    private String getConnectionHost(
+            InboundConnection connection
+    ) {
+        try {
+            return connection
+                    .getVirtualHost()
+                    .map(InetSocketAddress::getHostString)
+                    .orElse("<unknown>")
+                    .replaceAll("\\p{Cntrl}", "?");
+        } catch (RuntimeException e) {
+            return "<unknown>";
+        }
+    }
+
+    private void logRejected(
+            String type,
+            InboundConnection connection
+    ) {
+        logger.info(
+                "Host Gate rejected {} from {} using host '{}'",
+                type,
+                connection.getRemoteAddress(),
+                getConnectionHost(connection)
+        );
+    }
+
     private boolean closeSilently(
             InboundConnection connection
     ) {
         try {
-            Method delegatedMethod =
-                    delegatedConnectionMethod;
+            Method delegatedMethod = delegatedConnectionMethod;
 
             if (delegatedMethod == null
                     || !delegatedMethod
@@ -344,8 +491,7 @@ public final class HostGatePlugin {
                 );
             }
 
-            Method closeMethod =
-                    closeConnectionMethod;
+            Method closeMethod = closeConnectionMethod;
 
             if (closeMethod == null
                     || !closeMethod
@@ -354,13 +500,12 @@ public final class HostGatePlugin {
                             minecraftConnection.getClass()
                     )) {
 
-                closeMethod =
-                        minecraftConnection
-                                .getClass()
-                                .getMethod(
-                                        "close",
-                                        boolean.class
-                                );
+                closeMethod = minecraftConnection
+                        .getClass()
+                        .getMethod(
+                                "close",
+                                boolean.class
+                        );
 
                 closeConnectionMethod = closeMethod;
             }
@@ -375,8 +520,7 @@ public final class HostGatePlugin {
                  | RuntimeException e) {
 
             logger.error(
-                    "Host Gate could not silently close "
-                            + "a rejected connection",
+                    "Host Gate could not silently close rejected connection",
                     e
             );
 
@@ -407,29 +551,24 @@ public final class HostGatePlugin {
         );
     }
 
-    private record Policy(
-            boolean valid,
-            boolean allowOnlyForcedHosts,
-            Set<String> exactHosts,
-            List<Pattern> wildcardPatterns
-    ) {
-        private static Policy denyAll() {
-            return new Policy(
-                    false,
-                    true,
-                    Set.of(),
-                    List.of()
-            );
-        }
-    }
-
     @Subscribe
     public void onPing(ProxyPingEvent event) {
-        if (!isAllowed(event.getConnection())) {
-            event.setResult(
-                    ResultedEvent.GenericResult.denied()
+        if (isAllowed(event.getConnection())) {
+            return;
+        }
+
+        Policy current = policy;
+
+        if (current.logRejectedPings()) {
+            logRejected(
+                    "ping",
+                    event.getConnection()
             );
         }
+
+        event.setResult(
+                ResultedEvent.GenericResult.denied()
+        );
     }
 
     @Subscribe
@@ -438,15 +577,163 @@ public final class HostGatePlugin {
             return;
         }
 
+        Policy current = policy;
+
+        if (current.logRejectedConnections()) {
+            logRejected(
+                    "login",
+                    event.getConnection()
+            );
+        }
+
+        if (current.rejectMode() == RejectMode.DISCONNECT) {
+            event.setResult(
+                    PreLoginEvent.PreLoginComponentResult.denied(
+                            Component.text(
+                                    current.disconnectMessage()
+                            )
+                    )
+            );
+
+            return;
+        }
+
         if (closeSilently(event.getConnection())) {
             return;
         }
 
-        /** Failback if for some reason the close connection doesnt work, to prevent allowing anyone to still access invalid hostnames/ips */
         event.setResult(
                 PreLoginEvent.PreLoginComponentResult.denied(
-                        Component.text("Disconnected")
+                        Component.text(
+                                current.disconnectMessage()
+                        )
                 )
         );
+    }
+
+    private final class HostGateCommand
+            implements SimpleCommand {
+
+        @Override
+        public void execute(Invocation invocation) {
+            if (!invocation
+                    .source()
+                    .hasPermission("hostgate.reload")) {
+
+                invocation
+                        .source()
+                        .sendMessage(
+                                Component.text(
+                                        "You do not have permission to use this command."
+                                )
+                        );
+
+                return;
+            }
+
+            String[] arguments = invocation.arguments();
+
+            if (arguments.length != 1
+                    || !arguments[0].equalsIgnoreCase("reload")) {
+
+                invocation
+                        .source()
+                        .sendMessage(
+                                Component.text(
+                                        "Usage: /hostgate reload"
+                                )
+                        );
+
+                return;
+            }
+
+            if (reloadConfiguration()) {
+                invocation
+                        .source()
+                        .sendMessage(
+                                Component.text(
+                                        "Host Gate configuration reloaded."
+                                )
+                        );
+            } else {
+                invocation
+                        .source()
+                        .sendMessage(
+                                Component.text(
+                                        "Host Gate configuration could not be loaded. Check the proxy log."
+                                )
+                        );
+            }
+        }
+
+        @Override
+        public List<String> suggest(
+                Invocation invocation
+        ) {
+            if (!invocation
+                    .source()
+                    .hasPermission("hostgate.reload")) {
+                return List.of();
+            }
+
+            String[] arguments = invocation.arguments();
+
+            if (arguments.length == 0) {
+                return List.of("reload");
+            }
+
+            if (arguments.length == 1
+                    && "reload"
+                    .startsWith(
+                            arguments[0]
+                                    .toLowerCase(Locale.ROOT)
+                    )) {
+                return List.of("reload");
+            }
+
+            return List.of();
+        }
+    }
+
+    private enum RejectMode {
+        SILENT,
+        DISCONNECT
+    }
+
+    private record Policy(
+            boolean valid,
+            boolean allowOnlyForcedHosts,
+            Set<String> exactHosts,
+            List<Pattern> wildcardPatterns,
+            RejectMode rejectMode,
+            String disconnectMessage,
+            boolean logRejectedConnections,
+            boolean logRejectedPings
+    ) {
+        private static Policy denyAll() {
+            return new Policy(
+                    false,
+                    true,
+                    Set.of(),
+                    List.of(),
+                    RejectMode.SILENT,
+                    "Disconnected",
+                    false,
+                    false
+            );
+        }
+
+        private static Policy allowAll() {
+            return new Policy(
+                    true,
+                    false,
+                    Set.of(),
+                    List.of(),
+                    RejectMode.SILENT,
+                    "Disconnected",
+                    false,
+                    false
+            );
+        }
     }
 }
