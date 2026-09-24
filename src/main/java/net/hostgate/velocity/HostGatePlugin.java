@@ -8,6 +8,7 @@ import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyPingEvent;
+import com.velocitypowered.api.event.proxy.ProxyReloadEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.InboundConnection;
@@ -130,6 +131,12 @@ public final class HostGatePlugin {
         proxyServer
                 .getCommandManager()
                 .register(meta, new HostGateCommand());
+    }
+
+    @Subscribe
+    public void onProxyReload(ProxyReloadEvent event) {
+        silentCloseUnavailable.set(false);
+        reloadConfiguration();
     }
 
     private Path getConfigPath() {
